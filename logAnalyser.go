@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	_ "github.com/lib/pq"
+    "golang.org/x/crypto/bcrypt"
 	"os"
 	"regexp"
 	"strconv"
@@ -72,15 +73,21 @@ func query(sql string) {
 
 func insertInfoRow(sql string, finished chan bool, info userInfo) {
 	timeString := strconv.Itoa(info.time)
+    ip := []byte(info.ipaddress)
+	ipHash,err := bcrypt.GenerateFromPassword(ip, bcrypt.MinCost)
+    checkErr(err)
 
-	_, err := db.Exec(sql, info.mobileType, info.ipaddress, info.date, info.requestType, info.version, info.protocol, info.status, timeString)
+	_, err = db.Exec(sql, info.mobileType, ipHash, info.date, info.requestType, info.version, info.protocol, info.status, timeString)
 	checkErr(err)
 	finished <- true
 }
 
 func insertIpRow(sql string, finished chan bool, ipEntry entryCount, mType string) {
-	_, err := db.Exec(sql, mType, ipEntry.entry, ipEntry.number)
-	checkErr(err)
+    ip := []byte(ipEntry.entry)
+	ipHash,err := bcrypt.GenerateFromPassword(ip, bcrypt.MinCost)
+    checkErr(err)
+	_, err = db.Exec(sql, mType, ipHash, ipEntry.number)
+    checkErr(err)
 	finished <- true
 }
 
