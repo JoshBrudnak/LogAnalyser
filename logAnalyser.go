@@ -5,25 +5,26 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
-	_ "github.com/lib/pq"
-    "golang.org/x/crypto/bcrypt"
+	"io/ioutil"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	_ "github.com/lib/pq"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
-	uMobileUses        = "create table if not exists uMobileUsers(id serial primary key, type text, ipAddress text, datetime text, requestType text, version text, protocol text, status int, time int)"
+	uMobileUses        = "create table if not exists uMobileUsers(id serial primary key, type text, ipAddress text, datetime text, requestType text, version text, protocol text, status int, bytes int)"
 	uMobileIpEntry     = "create table if not exists uMobileIpEntries(id serial primary key, type text, ipAddress text, numberOfUses text)"
-	uMobileData        = "create table if not exists uMobileLogData(id serial primary key, date text, startTime time, endTime time, iosLength int, androidLength int, duration text, iosTimeAverage int, androidTimeAverage int)"
-	clearUses          = "drop table uMobileUsers"
-	clearIpEntries     = "drop table uMobileIpEntries"
-	uMobileInsert      = "INSERT INTO uMobileUsers(type, ipAddress, datetime, requesttype, version, protocol, status, time) VALUES($1, $2, $3, $4, $5, $6, $7, $8)"
+	uMobileData        = "create table if not exists uMobileLogData(id serial primary key, date text, startTime time, endTime time, iosLength int, androidLength int, duration text, iosBytesAverage int, androidBytesAverage int)"
+	uMobileInsert      = "INSERT INTO uMobileUsers(type, ipAddress, datetime, requesttype, version, protocol, status, bytes) VALUES($1, $2, $3, $4, $5, $6, $7, $8)"
 	uMobileEntryInsert = "INSERT INTO uMobileIpEntries(type, ipAddress, numberofUses) VALUES($1, $2, $3)"
-	logDataInsert      = "INSERT INTO uMobileLogData(date, startTime, endTime, iosLength, androidLength, duration, iosTimeAverage, androidTimeAverage) VALUES($1, $2, $3, $4, $5, $6, $7, $8)"
+	logDataInsert      = "INSERT INTO uMobileLogData(date, startTime, endTime, iosLength, androidLength, duration, iosBytesAverage, androidBytesAverage) VALUES($1, $2, $3, $4, $5, $6, $7, $8)"
 )
 
 var db *sql.DB
@@ -43,7 +44,7 @@ type userInfo struct {
 	version     string
 	protocol    string
 	status      int
-	time        int
+	bytes       int
 }
 
 type entryCount struct {
@@ -53,13 +54,14 @@ type entryCount struct {
 
 type logData struct {
 	date      string
-    startTime string
-    endTime   string
+	startTime string
+	endTime   string
 	duration  string
-	timeAvg   int
+	dataAvg   int
 	length    int
 }
 
+// add log instead of err
 func checkErr(err error) {
 	if err != nil {
 		panic(err)
@@ -71,53 +73,59 @@ func query(sql string) {
 	checkErr(err)
 }
 
-func insertInfoRow(sql string, finished chan bool, info userInfo) {
-	timeString := strconv.Itoa(info.time)
-    ip := []byte(info.ipaddress)
-	ipHash,err := bcrypt.GenerateFromPassword(ip, bcrypt.MinCost)
-    checkErr(err)
+func getInstructions() {
+	dir := "Log Analyser Manual\n\nSYNOPSIS\n\tlogAnalyser [flags] [file names/ file path]\nDESCRIPTION\n\t-h\tDisplay the help menu.\n\t-a\tAnalyse all text files in the current directory.\n"
+	fmt.Println(dir)
+}
 
-	_, err = db.Exec(sql, info.mobileType, ipHash, info.date, info.requestType, info.version, info.protocol, info.status, timeString)
+func insertInfoRow(sql string, finished chan bool, info userInfo) {
+	bytesString := strconv.Itoa(info.bytes)
+	ip := []byte(info.ipaddress)
+	ipHash, _ := bcrypt.GenerateFromPassword(ip, bcrypt.MinCost)
+	_, err := db.Exec(sql, info.mobileType, ipHash, info.date, info.requestType, info.version, info.protocol, info.status, bytesString)
 	checkErr(err)
 	finished <- true
 }
 
 func insertIpRow(sql string, finished chan bool, ipEntry entryCount, mType string) {
-    ip := []byte(ipEntry.entry)
-	ipHash,err := bcrypt.GenerateFromPassword(ip, bcrypt.MinCost)
-    checkErr(err)
-	_, err = db.Exec(sql, mType, ipHash, ipEntry.number)
-    checkErr(err)
+	ip := []byte(ipEntry.entry)
+	ipHash, _ := bcrypt.GenerateFromPassword(ip, bcrypt.MinCost)
+	_, err := db.Exec(sql, mType, ipHash, ipEntry.number)
+	checkErr(err)
 	finished <- true
 }
 
 func insertLogDataRow(sql string, androidInfo logData, iosInfo logData) {
-	_, err := db.Exec(sql, iosInfo.date, iosInfo.startTime, iosInfo.endTime, iosInfo.length, androidInfo.length, iosInfo.duration, iosInfo.timeAvg, androidInfo.timeAvg)
+	_, err := db.Exec(sql, iosInfo.date, iosInfo.startTime, iosInfo.endTime, iosInfo.length, androidInfo.length, iosInfo.duration, iosInfo.dataAvg, androidInfo.dataAvg)
 	checkErr(err)
 }
 
-func getTime(dateTime time.Time) string {
-	hour,min,sec := dateTime.Clock()
-    sHour := strconv.Itoa(hour)
+func getTime(dateTime string) string {
+	time, _ := time.Parse("02/Jan/2006:15:04:05 -0700", dateTime)
+	hour, min, sec := time.Clock()
+	sHour := strconv.Itoa(hour)
 	sMin := strconv.Itoa(min)
-    sSec := strconv.Itoa(sec)
-    s := []string{sHour, ":", sMin, ":", sSec};
-    clock := strings.Join(s, "")
+	sSec := strconv.Itoa(sec)
+	s := []string{sHour, ":", sMin, ":", sSec}
+	clock := strings.Join(s, "")
 
 	return clock
 }
 
-func grepLines(log *os.File, text string) []string {
-	var foundLines []string
+func grepLines(log *os.File) ([]string, []string) {
+	var iosLines, androidLines []string
 	scanner := bufio.NewScanner(log)
 	for scanner.Scan() {
-		if bytes.Contains(scanner.Bytes(), []byte(text)) {
+		if bytes.Contains(scanner.Bytes(), []byte("android")) {
 			line := string(scanner.Bytes())
-			foundLines = append(foundLines, line)
+			androidLines = append(androidLines, line)
+		} else if bytes.Contains(scanner.Bytes(), []byte("iOS")) {
+			line := string(scanner.Bytes())
+			iosLines = append(iosLines, line)
 		}
 	}
 	log.Close()
-	return foundLines
+	return iosLines, androidLines
 }
 
 func trimString(text string) string {
@@ -157,16 +165,14 @@ func analyseEntries(entries []userInfo) logData {
 	var date []time.Time
 	var ipEntry []string
 	var statusEntry []string
-	var timeAvg int
+	var dataAvg int
 	var difference time.Duration
 	entryLen := len(entries)
 	infoFinished := make([]chan bool, entryLen)
-
-	for i := range infoFinished {
-		infoFinished[i] = make(chan bool)
-	}
+	count := 0
 
 	for i := range entries {
+		infoFinished[i] = make(chan bool)
 		time, _ := time.Parse("02/Jan/2006:15:04:05 -0700", entries[i].date)
 		date = append(date, time)
 		ipEntry = append(ipEntry, entries[i].ipaddress)
@@ -175,29 +181,25 @@ func analyseEntries(entries []userInfo) logData {
 	}
 
 	ipEntries := getEntryCount(ipEntry)
-
 	ipFinished := make([]chan bool, len(ipEntries))
 	for i := range ipFinished {
 		ipFinished[i] = make(chan bool)
 	}
-
 	if len(date) > 0 {
 		difference = date[len(date)-1].Sub(date[0])
 	}
-
+	// get average page request time
 	for i := range entries {
-		if entries[i].time != 0 {
-			timeAvg += entries[i].time
+		if entries[i].bytes != 0 {
+			dataAvg += entries[i].bytes
+			count++
 		}
 	}
-
 	if len(entries) > 0 {
-		timeAvg = timeAvg / len(entries)
+		dataAvg = dataAvg / count
 	} else {
-		timeAvg = 0
+		dataAvg = 0
 	}
-
-	estart := time.Now()
 	for i := range entries {
 		go insertInfoRow(uMobileInsert, infoFinished[i], entries[i])
 	}
@@ -211,21 +213,15 @@ func analyseEntries(entries []userInfo) logData {
 		<-ipFinished[i]
 	}
 
-	elapsed := time.Since(estart)
-	fmt.Print("Query took ")
-	fmt.Println(elapsed)
-
-    //Set up log data struct
-	startTime, _ := time.Parse("02/Jan/2006:15:04:05 -0700", entries[0].date)
-    startClock := getTime(startTime)
-	endTime, _ := time.Parse("02/Jan/2006:15:04:05 -0700", entries[len(entries) - 1].date)
-    endClock := getTime(endTime)
+	//Set up log data struct
+	startClock := getTime(entries[0].date)
+	endClock := getTime(entries[len(entries)-1].date)
 	year, month, day := date[0].Date()
 	sYear := strconv.Itoa(year)
 	sMonth := month.String()
 	sDay := strconv.Itoa(day)
 	logDate := fmt.Sprintf("%s/%s/%s", sMonth, sDay, sYear)
-	logStats := logData{logDate, startClock, endClock, difference.String(), timeAvg, entryLen}
+	logStats := logData{logDate, startClock, endClock, difference.String(), dataAvg, entryLen}
 
 	return logStats
 }
@@ -240,7 +236,7 @@ func getEntries(lines []string, mobileType string, data chan logData) {
 		status, _ := strconv.Atoi(lineParts[6])
 		dateArray := []string{lineParts[1], lineParts[2]}
 		date := strings.Join(dateArray, " ")
-		time, _ := strconv.Atoi(lineParts[7])
+		bytes, _ := strconv.Atoi(lineParts[7])
 
 		// find version number
 		urlParts := strings.Split(lineParts[4], "/")
@@ -254,7 +250,7 @@ func getEntries(lines []string, mobileType string, data chan logData) {
 				}
 			}
 		}
-		entry := userInfo{mobileType, lineParts[0], date, lineParts[3], versions, lineParts[5], status, time}
+		entry := userInfo{mobileType, lineParts[0], date, lineParts[3], versions, lineParts[5], status, bytes}
 		entries = append(entries, entry)
 	}
 
@@ -263,38 +259,24 @@ func getEntries(lines []string, mobileType string, data chan logData) {
 }
 
 func getData(arg string, finished chan bool) {
-	androidLogData := make(chan logData)
 	iosLogData := make(chan logData)
-	error := false
-
-	iosLog, err := os.Open(arg)
+	androidLogData := make(chan logData)
+	log, err := os.Open(arg)
 	if err != nil {
 		fmt.Printf("%s could not be found\n", arg)
-		error = true
-	}
-
-	if !error {
-		androidLog, _ := os.Open(arg)
-		iosLines := grepLines(iosLog, "iOS")
-		androidLines := grepLines(androidLog, "android")
+	} else {
+		androidLines, iosLines := grepLines(log)
 		go getEntries(iosLines, "iOS", iosLogData)
 		go getEntries(androidLines, "android", androidLogData)
 		iosData := <-iosLogData
 		androidData := <-androidLogData
 		insertLogDataRow(logDataInsert, androidData, iosData)
 	}
-
 	finished <- true
 }
 
-func main() {
-	start := time.Now()
+func initDb() {
 	var c config
-	finished := make([]chan bool, len(os.Args)-1)
-	for i := range finished {
-		finished[i] = make(chan bool)
-	}
-
 	file, err := os.Open("database.json")
 	checkErr(err)
 	decoder := json.NewDecoder(file)
@@ -302,23 +284,47 @@ func main() {
 	checkErr(err)
 	dbURL := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", c.Username, c.Password, c.URL, c.Dbname)
 	db, err = sql.Open("postgres", dbURL)
-	db.SetMaxOpenConns(50)
+	checkErr(err)
+	db.SetMaxOpenConns(80)
+}
 
-	query(clearUses)
-	query(clearIpEntries)
+func main() {
+	var help, all bool
+	initDb()
+	start := time.Now()
+
+	flag.BoolVar(&help, "h", false, "help menu")
+	flag.BoolVar(&all, "a", false, "analyse all logs")
+	flag.Parse()
+	fileArgs := flag.Args()
+
+	if help {
+		getInstructions()
+		os.Exit(0)
+	}
+	if all {
+		files, _ := ioutil.ReadDir("./")
+		for _, f := range files {
+			name := f.Name()
+			if strings.Contains(name, ".txt") {
+				fileArgs = append(fileArgs, name)
+			}
+		}
+	}
+
+	finished := make([]chan bool, len(fileArgs))
+	for i := range finished {
+		finished[i] = make(chan bool)
+	}
 	query(uMobileUses)
 	query(uMobileIpEntry)
 	query(uMobileData)
 
-	if err != nil {
-		panic(err)
-	} else {
-		for i := 1; i < len(os.Args); i++ {
-			go getData(os.Args[i], finished[i-1])
-		}
-		for i := range finished {
-			<-finished[i]
-		}
+	for i := 0; i < len(fileArgs); i++ {
+		go getData(fileArgs[i], finished[i])
+	}
+	for i := range finished {
+		<-finished[i]
 	}
 	elapsed := time.Since(start)
 	fmt.Print("Program took ")
