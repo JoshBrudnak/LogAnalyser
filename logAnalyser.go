@@ -74,7 +74,7 @@ func query(sql string) {
 }
 
 func getInstructions() {
-	dir := "Log Analyser Manual\n\nSYNOPSIS\n\tlogAnalyser [flags] [file names/ file path]\nDESCRIPTION\n\t-h\tDisplay the help menu.\n\t-a\tAnalyse all text files in the current directory.\n"
+	dir := "Log Analyser Manual\n\nSYNOPSIS\n\tlogAnalyser [flags] [file names/path]\nDESCRIPTION\n\t-h\tDisplay the help menu.\n\t-a\tAnalyse all text files in the current directory.\n\t-l\tOnly save overall log statistics. User and ip entry data will not be saved"
 	fmt.Println(dir)
 }
 
@@ -161,7 +161,7 @@ func getEntryCount(entries []string) []entryCount {
 	return entryMembers
 }
 
-func analyseEntries(entries []userInfo) logData {
+func analyseEntries(entries []userInfo, log bool) logData {
 	var date []time.Time
 	var ipEntry []string
 	var statusEntry []string
@@ -200,6 +200,7 @@ func analyseEntries(entries []userInfo) logData {
 	} else {
 		dataAvg = 0
 	}
+    if !log {
 	for i := range entries {
 		go insertInfoRow(uMobileInsert, infoFinished[i], entries[i])
 	}
@@ -212,6 +213,7 @@ func analyseEntries(entries []userInfo) logData {
 	for i := range ipFinished {
 		<-ipFinished[i]
 	}
+    }
 
 	//Set up log data struct
 	startClock := getTime(entries[0].date)
@@ -226,7 +228,7 @@ func analyseEntries(entries []userInfo) logData {
 	return logStats
 }
 
-func getEntries(lines []string, mobileType string, data chan logData) {
+func getEntries(lines []string, mobileType string, data chan logData, log bool) {
 	entries := make([]userInfo, 0)
 
 	for i := 0; i < len(lines); i++ {
@@ -254,11 +256,11 @@ func getEntries(lines []string, mobileType string, data chan logData) {
 		entries = append(entries, entry)
 	}
 
-	logStats := analyseEntries(entries)
+	logStats := analyseEntries(entries, log)
 	data <- logStats
 }
 
-func getData(arg string, finished chan bool) {
+func getData(arg string, finished chan bool, saveLog bool) {
 	iosLogData := make(chan logData)
 	androidLogData := make(chan logData)
 	log, err := os.Open(arg)
@@ -266,8 +268,8 @@ func getData(arg string, finished chan bool) {
 		fmt.Printf("%s could not be found\n", arg)
 	} else {
 		androidLines, iosLines := grepLines(log)
-		go getEntries(iosLines, "iOS", iosLogData)
-		go getEntries(androidLines, "android", androidLogData)
+		go getEntries(iosLines, "iOS", iosLogData, saveLog)
+		go getEntries(androidLines, "android", androidLogData, saveLog)
 		iosData := <-iosLogData
 		androidData := <-androidLogData
 		insertLogDataRow(logDataInsert, androidData, iosData)
@@ -275,7 +277,7 @@ func getData(arg string, finished chan bool) {
 	finished <- true
 }
 
-func initDb() {
+func init() {
 	var c config
 	file, err := os.Open("database.json")
 	checkErr(err)
@@ -289,18 +291,17 @@ func initDb() {
 }
 
 func main() {
-	var help, all bool
-	initDb()
+	var help, all, log bool
 	start := time.Now()
-
 	flag.BoolVar(&help, "h", false, "help menu")
 	flag.BoolVar(&all, "a", false, "analyse all logs")
+	flag.BoolVar(&log, "l", false, "only get global log data")
 	flag.Parse()
 	fileArgs := flag.Args()
 
 	if help {
 		getInstructions()
-		os.Exit(0)
+        return
 	}
 	if all {
 		files, _ := ioutil.ReadDir("./")
@@ -321,7 +322,7 @@ func main() {
 	query(uMobileData)
 
 	for i := 0; i < len(fileArgs); i++ {
-		go getData(fileArgs[i], finished[i])
+		go getData(fileArgs[i], finished[i], log)
 	}
 	for i := range finished {
 		<-finished[i]
