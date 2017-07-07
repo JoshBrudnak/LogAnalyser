@@ -85,25 +85,25 @@ func getInstructions() {
 	fmt.Println(dir)
 }
 
-func insertInfoRow(sql string, finished chan bool, info userInfo) {
+func insertInfoRow(finished chan bool, info userInfo) {
 	bytesString := strconv.Itoa(info.bytes)
 	ip := []byte(info.ipaddress)
 	ipHash, _ := bcrypt.GenerateFromPassword(ip, bcrypt.MinCost)
-	_, err := db.Exec(sql, info.mobileType, ipHash, info.date, info.requestType, info.version, info.protocol, info.status, bytesString)
+	_, err := db.Exec(uMobileInsert, info.mobileType, ipHash, info.date, info.requestType, info.version, info.protocol, info.status, bytesString)
 	logIfErr(err)
 	finished <- true
 }
 
-func insertIpRow(sql string, finished chan bool, ipEntry entryCount, mType string) {
+func insertIpRow(finished chan bool, ipEntry entryCount, mType string) {
 	ip := []byte(ipEntry.entry)
 	ipHash, _ := bcrypt.GenerateFromPassword(ip, bcrypt.MinCost)
-	_, err := db.Exec(sql, mType, ipHash, ipEntry.number)
+	_, err := db.Exec(uMobileEntryInsert, mType, ipHash, ipEntry.number)
 	logIfErr(err)
 	finished <- true
 }
 
-func insertLogDataRow(sql string, androidInfo logData, iosInfo logData) {
-	_, err := db.Exec(sql, iosInfo.date, iosInfo.startTime, iosInfo.endTime, iosInfo.length, androidInfo.length, iosInfo.duration, iosInfo.dataAvg, androidInfo.dataAvg)
+func insertLogDataRow(androidInfo logData, iosInfo logData) {
+	_, err := db.Exec(logDataInsert, iosInfo.date, iosInfo.startTime, iosInfo.endTime, iosInfo.length, androidInfo.length, iosInfo.duration, iosInfo.dataAvg, androidInfo.dataAvg)
 	logIfErr(err)
 }
 
@@ -206,10 +206,10 @@ func analyseEntries(entries []userInfo) logData {
 	}
 	if !logOnly {
 		for i := range entries {
-			go insertInfoRow(uMobileInsert, infoFinished[i], entries[i])
+			go insertInfoRow(infoFinished[i], entries[i])
 		}
 		for i := range ipEntries {
-			go insertIpRow(uMobileEntryInsert, ipFinished[i], ipEntries[i], entries[i].mobileType)
+			go insertIpRow(ipFinished[i], ipEntries[i], entries[i].mobileType)
 		}
 		for i := range infoFinished {
 			<-infoFinished[i]
@@ -236,29 +236,32 @@ func getEntries(lines []string, mobileType string, data chan logData) {
 	entries := make([]userInfo, 0)
 
 	for i := 0; i < len(lines); i++ {
-		//reader := gonx.NewReader(file, format)
 		var versions string
 		finalLine := trimString(lines[i])
 		lineParts := strings.Split(finalLine, " ")
-		status, _ := strconv.Atoi(lineParts[6])
-		dateArray := []string{lineParts[1], lineParts[2]}
-		date := strings.Join(dateArray, " ")
-		bytes, _ := strconv.Atoi(lineParts[7])
+		if len(lineParts) > 7 {
+			status, _ := strconv.Atoi(lineParts[6])
+			dateArray := []string{lineParts[1], lineParts[2]}
+			date := strings.Join(dateArray, " ")
+			bytes, _ := strconv.Atoi(lineParts[7])
 
-		// find version number
-		urlParts := strings.Split(lineParts[4], "/")
-		for j := range urlParts {
-			versionParts := strings.Split(urlParts[j], "")
-			if len(versionParts) > 0 {
-				_, err := strconv.Atoi(versionParts[0])
-				if err == nil {
-					versions = urlParts[j]
-					break
+			// find version number
+			urlParts := strings.Split(lineParts[4], "/")
+			for j := range urlParts {
+				versionParts := strings.Split(urlParts[j], "")
+				if len(versionParts) > 0 {
+					_, err := strconv.Atoi(versionParts[0])
+					if err == nil {
+						versions = urlParts[j]
+						break
+					}
 				}
 			}
+			entry := userInfo{mobileType, lineParts[0], date, lineParts[3], versions, lineParts[5], status, bytes}
+			entries = append(entries, entry)
+		} else {
+			log.Println("Index out of range log entry is not valid")
 		}
-		entry := userInfo{mobileType, lineParts[0], date, lineParts[3], versions, lineParts[5], status, bytes}
-		entries = append(entries, entry)
 	}
 
 	logStats := analyseEntries(entries)
@@ -277,7 +280,7 @@ func getData(arg string, finished chan bool) {
 		go getEntries(androidLines, "android", androidLogData)
 		iosData := <-iosLogData
 		androidData := <-androidLogData
-		insertLogDataRow(logDataInsert, androidData, iosData)
+		insertLogDataRow(androidData, iosData)
 	}
 	log.Printf("Finished analysing %s", arg)
 	finished <- true
