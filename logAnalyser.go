@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"regexp"
 	"strconv"
@@ -28,6 +29,7 @@ const (
 )
 
 var db *sql.DB
+var logOnly bool
 
 type config struct {
 	URL      string
@@ -61,10 +63,15 @@ type logData struct {
 	length    int
 }
 
-// add log instead of err
 func checkErr(err error) {
 	if err != nil {
 		panic(err)
+	}
+}
+
+func logIfErr(err error) {
+	if err != nil {
+		log.Println(err)
 	}
 }
 
@@ -83,7 +90,7 @@ func insertInfoRow(sql string, finished chan bool, info userInfo) {
 	ip := []byte(info.ipaddress)
 	ipHash, _ := bcrypt.GenerateFromPassword(ip, bcrypt.MinCost)
 	_, err := db.Exec(sql, info.mobileType, ipHash, info.date, info.requestType, info.version, info.protocol, info.status, bytesString)
-	checkErr(err)
+	logIfErr(err)
 	finished <- true
 }
 
@@ -91,13 +98,13 @@ func insertIpRow(sql string, finished chan bool, ipEntry entryCount, mType strin
 	ip := []byte(ipEntry.entry)
 	ipHash, _ := bcrypt.GenerateFromPassword(ip, bcrypt.MinCost)
 	_, err := db.Exec(sql, mType, ipHash, ipEntry.number)
-	checkErr(err)
+	logIfErr(err)
 	finished <- true
 }
 
 func insertLogDataRow(sql string, androidInfo logData, iosInfo logData) {
 	_, err := db.Exec(sql, iosInfo.date, iosInfo.startTime, iosInfo.endTime, iosInfo.length, androidInfo.length, iosInfo.duration, iosInfo.dataAvg, androidInfo.dataAvg)
-	checkErr(err)
+	logIfErr(err)
 }
 
 func getTime(dateTime string) string {
@@ -125,7 +132,7 @@ func grepLines(log *os.File) ([]string, []string) {
 		}
 	}
 	log.Close()
-	return iosLines, androidLines
+	return androidLines, iosLines
 }
 
 func trimString(text string) string {
@@ -149,7 +156,6 @@ func getEntryCount(entries []string) []entryCount {
 				index = j
 			}
 		}
-
 		if !found {
 			ipentry := entryCount{entries[i], 1}
 			entryMembers = append(entryMembers, ipentry)
@@ -161,10 +167,9 @@ func getEntryCount(entries []string) []entryCount {
 	return entryMembers
 }
 
-func analyseEntries(entries []userInfo, log bool) logData {
+func analyseEntries(entries []userInfo) logData {
 	var date []time.Time
-	var ipEntry []string
-	var statusEntry []string
+	var ipEntry, statusEntry []string
 	var dataAvg int
 	var difference time.Duration
 	entryLen := len(entries)
@@ -188,7 +193,6 @@ func analyseEntries(entries []userInfo, log bool) logData {
 	if len(date) > 0 {
 		difference = date[len(date)-1].Sub(date[0])
 	}
-	// get average page request time
 	for i := range entries {
 		if entries[i].bytes != 0 {
 			dataAvg += entries[i].bytes
@@ -200,20 +204,20 @@ func analyseEntries(entries []userInfo, log bool) logData {
 	} else {
 		dataAvg = 0
 	}
-    if !log {
-	for i := range entries {
-		go insertInfoRow(uMobileInsert, infoFinished[i], entries[i])
+	if !logOnly {
+		for i := range entries {
+			go insertInfoRow(uMobileInsert, infoFinished[i], entries[i])
+		}
+		for i := range ipEntries {
+			go insertIpRow(uMobileEntryInsert, ipFinished[i], ipEntries[i], entries[i].mobileType)
+		}
+		for i := range infoFinished {
+			<-infoFinished[i]
+		}
+		for i := range ipFinished {
+			<-ipFinished[i]
+		}
 	}
-	for i := range ipEntries {
-		go insertIpRow(uMobileEntryInsert, ipFinished[i], ipEntries[i], entries[i].mobileType)
-	}
-	for i := range infoFinished {
-		<-infoFinished[i]
-	}
-	for i := range ipFinished {
-		<-ipFinished[i]
-	}
-    }
 
 	//Set up log data struct
 	startClock := getTime(entries[0].date)
@@ -228,10 +232,11 @@ func analyseEntries(entries []userInfo, log bool) logData {
 	return logStats
 }
 
-func getEntries(lines []string, mobileType string, data chan logData, log bool) {
+func getEntries(lines []string, mobileType string, data chan logData) {
 	entries := make([]userInfo, 0)
 
 	for i := 0; i < len(lines); i++ {
+		//reader := gonx.NewReader(file, format)
 		var versions string
 		finalLine := trimString(lines[i])
 		lineParts := strings.Split(finalLine, " ")
@@ -256,24 +261,25 @@ func getEntries(lines []string, mobileType string, data chan logData, log bool) 
 		entries = append(entries, entry)
 	}
 
-	logStats := analyseEntries(entries, log)
+	logStats := analyseEntries(entries)
 	data <- logStats
 }
 
-func getData(arg string, finished chan bool, saveLog bool) {
+func getData(arg string, finished chan bool) {
 	iosLogData := make(chan logData)
 	androidLogData := make(chan logData)
-	log, err := os.Open(arg)
+	logFile, err := os.Open(arg)
 	if err != nil {
 		fmt.Printf("%s could not be found\n", arg)
 	} else {
-		androidLines, iosLines := grepLines(log)
-		go getEntries(iosLines, "iOS", iosLogData, saveLog)
-		go getEntries(androidLines, "android", androidLogData, saveLog)
+		androidLines, iosLines := grepLines(logFile)
+		go getEntries(iosLines, "iOS", iosLogData)
+		go getEntries(androidLines, "android", androidLogData)
 		iosData := <-iosLogData
 		androidData := <-androidLogData
 		insertLogDataRow(logDataInsert, androidData, iosData)
 	}
+	log.Printf("Finished analysing %s", arg)
 	finished <- true
 }
 
@@ -288,31 +294,32 @@ func init() {
 	db, err = sql.Open("postgres", dbURL)
 	checkErr(err)
 	db.SetMaxOpenConns(80)
+
+	f, err := os.OpenFile("uMobileLogAnalysis.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	log.SetOutput(f)
 }
 
 func main() {
-	var help, all, log bool
-	start := time.Now()
+	var help, all bool
 	flag.BoolVar(&help, "h", false, "help menu")
 	flag.BoolVar(&all, "a", false, "analyse all logs")
-	flag.BoolVar(&log, "l", false, "only get global log data")
+	flag.BoolVar(&logOnly, "l", false, "only save overall log data")
 	flag.Parse()
 	fileArgs := flag.Args()
 
 	if help {
 		getInstructions()
-        return
+		return
 	}
 	if all {
 		files, _ := ioutil.ReadDir("./")
 		for _, f := range files {
 			name := f.Name()
-			if strings.Contains(name, ".txt") {
+			if strings.Contains(name, "localhost_access_log") {
 				fileArgs = append(fileArgs, name)
 			}
 		}
 	}
-
 	finished := make([]chan bool, len(fileArgs))
 	for i := range finished {
 		finished[i] = make(chan bool)
@@ -322,12 +329,9 @@ func main() {
 	query(uMobileData)
 
 	for i := 0; i < len(fileArgs); i++ {
-		go getData(fileArgs[i], finished[i], log)
+		go getData(fileArgs[i], finished[i])
 	}
 	for i := range finished {
 		<-finished[i]
 	}
-	elapsed := time.Since(start)
-	fmt.Print("Program took ")
-	fmt.Println(elapsed)
 }
